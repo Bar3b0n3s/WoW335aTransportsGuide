@@ -27,9 +27,19 @@ No specific tool is named anywhere in this guide. Where a file path appears it i
 
 | Placeholder | Meaning |
 |---|---|
-| `<client>/Data/patch-X.MPQ/DBFilesClient/` | Whatever patch archive your client loads DBCs from |
+| `<client>/Data/patch-X.MPQ/DBFilesClient/` | Your custom DBC patch archive — see the naming rule below |
 | `<server>/Data/dbc/` | The server's extracted DBC folder, under your core's data directory |
 | `<server>/Data/vmaps/` | The server's extracted collision data |
+
+**[VERIFIED] The archive name matters.** Put every custom DBC in **one** archive, under
+`DBFilesClient\` at its root, named `Data/patch-<single character>.MPQ` — for example
+`patch-4.MPQ`. The extraction tools only open archives matching `patch-?.MPQ`, exactly one
+character, so `patch-custom.MPQ` or `patch-4b.MPQ` is never opened by them even though the client
+may load it. They read the base `Data/patch-?.MPQ` group *before* the locale group and take the
+first copy of a file they find, which is the opposite of the client's locale-first preference — so
+never keep a second copy of the same DBC in a locale patch. And do not ship the DBCs as a
+folder-style archive: a *directory* named `patch-4.MPQ` makes the extractor fail to open a required
+archive and skip that entire locale without extracting anything.
 
 ### 0.3 How the claims in this guide were verified — and how to re-check them
 
@@ -98,7 +108,7 @@ Both are called transports and both are gameobjects, but they share almost nothi
 |---|---|---|
 | Typical use | Elevator, lift, platform | Ship, zeppelin, gunship |
 | C++ class | plain `GameObject` | dedicated `Transport` class |
-| Spawned from | the `gameobject` table, like any object | the `transports` table **only** |
+| Spawned from | the `gameobject` table, like any object | the `transports` table — never `gameobject`. Continent routes only; a route on an instanceable map is created by an instance script instead (Part 3.2) |
 | Can you put it in `gameobject`? | Yes | **No** — the core refuses it outright |
 | Path data | `TransportAnimation.dbc`, keyed by **gameobject entry** | `TaxiPath.dbc` + `TaxiPathNode.dbc` |
 | Does the server move it? | **No** — that code is disabled | Yes, every 200 ms |
@@ -130,7 +140,11 @@ built, no update block is queued, no visibility update is triggered.
 
 What the client gets instead:
 
-1. **A spawn position**, once, when the object is created for it.
+1. **Its position at that instant**, once, in the create block built when the object first
+   becomes visible to that client. This is the only position on the wire — a type-15 transport
+   sends a "stationary position" block and no movement block — and that accessor is overridden for
+   this type to return the live simulated position, so it is where the ship is *now*, not where the
+   route starts.
 2. **A `PathProgress` counter** — milliseconds elapsed into the route's cycle.
 3. **All 24 `DataN` fields**, via the gameobject query the client sends when it first meets an
    unknown entry. That includes the taxi path id, the movement speed and the acceleration rate.
@@ -162,6 +176,11 @@ extracted copies were not regenerated to match, **every** transport is desynced,
 **[CONVENTION] Practical rule:** edit the taxi tables once, in one place, and deploy the *same
 bytes* to both sides. Either extract the server's DBCs from the patched client, or copy the edited
 files into both locations. Never hand-edit them twice.
+
+**[VERIFIED] If you re-extract rather than hand-copy, empty the extractor's output `dbc/` folder
+first.** The DBC extractor skips any file that already exists at the destination — no size or
+timestamp check — and reports that it extracted zero DBC files while silently handing you your old
+ones back.
 
 ### 1.2 Choosing IDs that will not collide
 
@@ -210,8 +229,15 @@ In stock data four pairs are already duplicated this way, so this is not hypothe
 **[CONVENTION] Three safe options, best first:**
 
 1. **Add two new `TaxiNodes.dbc` rows** for your route's endpoints and use those IDs. This is what
-   Blizzard does — every transport route has dedicated nodes named like `Transport, <place>`. They
-   are not flight masters, so they never appear in the flight network.
+   Blizzard *usually* does — most transport routes use dedicated nodes named `Transport, <place>`.
+   **Set both `MountCreatureID` columns to `0`.** That is the property that keeps a node out of the
+   faction taxi masks and out of the nearest-taxi-node lookup; the check is per faction, so even one
+   non-zero entry makes the node a live flight-master position for that side with no NPC there — and
+   because that lookup runs on the flight master's own coordinates, a stray node at a dock can
+   hijack a nearby real flight master. Never clone a flight-master row as a template without zeroing
+   these. Blizzard is not consistent here, so do not verify the pattern by sampling: several shipped
+   routes end at genuine flight-master nodes, and the gunship paths use `-1`. Copy the
+   dedicated-node pattern, not those.
 2. **Use a pair nothing else uses.** In stock data `(0, 0)` is free — but **verify that in your own
    copy first**, because it is an attractive default that custom content often grabs.
 3. **Reuse the endpoints of the route you are mirroring** — only after confirming no other path
@@ -236,10 +262,13 @@ offsets, not relative to anything.
 
 **[CONVENTION] Height, by vehicle type.** Very consistent in Blizzard's data, and worth copying:
 
-- **Boats use `Z = 0.0` on every node.** Sea level is zero on these maps and the hull model sits
-  correctly with the transport origin at zero. You do not need to sample water height.
-- **Zeppelins and gunships use real `Z` values** — roughly 70–280 for zeppelins, 580–790 for the
-  Icecrown gunships. Fly the route and record actual heights.
+- **Boats use `Z = 0.0` on every node** on every open-sea route Blizzard ships. Sea level is zero
+  on these maps and the hull sits correctly with the transport origin at zero, so you do not need to
+  sample water height. The one exception is the Sister Mercy, which manoeuvres inside a harbour and
+  uses real heights.
+- **Zeppelins and gunships use real `Z` values** — roughly 50–280 for the open-world zeppelins,
+  580–790 for the two Icecrown patrol gunships. The instanced raid gunship paths sit much lower and
+  span a far wider range, so do not copy their numbers. Fly the route and record actual heights.
 
 #### Spacing
 
@@ -275,9 +304,9 @@ Together: whatever your last surviving keyframe is, the vessel **snaps instantly
 to the first surviving keyframe, once per cycle, forever.
 
 **[CONVENTION] The fix Blizzard uses is padding.** Continue the route past its start point by
-repeating the first couple of nodes at the end. After the core trims one node off each end, the
-last remaining keyframe sits on top of the first — so the mandatory teleport covers zero distance
-and is invisible.
+repeating the first few nodes at the end. After the core trims one node off each end, the last
+remaining keyframe sits on top of the first — so the mandatory teleport covers zero distance and is
+invisible.
 
 Measuring the closing jump across the real single-map routes shows both the technique and what
 happens without it:
@@ -295,9 +324,16 @@ happens without it:
 The Moonspray really does jump 600 yards on every circuit. That is a flaw in Blizzard's data, not a
 mystery — and it is exactly what your route will do if you skip the padding.
 
-> **[CONVENTION] Recipe for a seamless loop:** lay the circuit out so it returns to its start, then
-> append copies of your first two nodes to the end. Check that after dropping the first and last
-> node, the new first and last nodes are at the same position.
+> **[CONVENTION] Recipe for a seamless loop:** lay the circuit out so it comes back round to its
+> start, then continue past it by repeating your first nodes — **three** copies for a route that
+> stops just short of its start point. The test is the invariant, not the count: after dropping the
+> first and last node, the new first and last nodes must be at the same position. Blizzard's
+> Feathermoon Ferry does exactly this — 19 nodes, indices 16–18 repeating 0–2, closing gap 0.3 yd.
+>
+> Node 0 and all three pad nodes must be **plain** — `Flags = 0`, no arrival or departure event. The
+> core only trims an end node that is neither a stop frame nor an event node, so a node 0 that is a
+> dock stop survives, the padding is wasted, and the loop closes on a full leg. Put your first dock
+> stop at node 1 or later.
 
 A route that is not a loop — a patrol that reverses, or a shuttle between two docks — should be
 authored as a there-and-back circuit, since every path cycles forever.
@@ -322,7 +358,7 @@ authored as a there-and-back circuit, since every path cycles forever.
 | 2 | `NodeIndex` | Order along the route, starting at `0`. |
 | 3 | `ContinentID` | Map ID this node is on. |
 | 4–6 | `X`, `Y`, `Z` | World coordinates on that map. |
-| 7 | `Flags` | `0` normal, `1` teleport/jump, `2` stop. Exact match, not a bitmask. |
+| 7 | `Flags` | `0` normal, bit 0 (`& 1`) teleport, `2` stop. The two tests differ: stop is exact equality, teleport is a bitmask — so `3` teleports but is **not** a stop. |
 | 8 | `Delay` | **Seconds** to wait. Only meaningful on a stop node. |
 | 9 | `ArrivalEventID` | Event fired on arrival at this node. `0` = none. |
 | 10 | `DepartureEventID` | Event fired on departure. `0` = none. |
@@ -331,13 +367,21 @@ authored as a there-and-back circuit, since every path cycles forever.
 validates this. A gap leaves a null entry that the path generator dereferences unconditionally,
 crashing the server during startup. If you delete a node, renumber everything after it.
 
-**[VERIFIED] A path needs at least two nodes.** Zero or one node passes the core's only check and
-then reads past the end of an array while building the spline. Also a startup crash.
+**[VERIFIED] A plain path needs at least four nodes.** The core trims one node off each end and
+then asserts that at least one keyframe survives — an assertion that is live in release builds — so
+a two-node plain path trims to nothing and **aborts the server at startup**. A three-node plain path
+leaves a single keyframe, and the movement tick returns immediately whenever there is one or fewer,
+so the vessel spawns and never moves. Four plain nodes is the first count that leaves two usable
+keyframes. Zero or one node is worse still: nothing validates the count, and the spline builder
+reads past the end of the point array. (Nodes that are stops or carry events are not trimmed, so a
+route whose ends are stops can survive on fewer — do not rely on it.)
 
-**[VERIFIED] `Flags` bit 0 (value `1`) marks a teleport.** The vessel jumps instantly from the
-previous node to the next. A teleport is also inserted **automatically** wherever `ContinentID`
-changes between consecutive nodes — you do not need to set the flag for a map change, and Blizzard
-generally does not. See Part 3.
+**[VERIFIED] `Flags` bit 0 (value `1`) marks a teleport — and costs you two nodes.** The flagged
+node *and the node immediately after it* are both dropped from the keyframe list: the flag latches a
+skip that swallows the following iteration. The vessel therefore jumps from the node *before* the
+flagged one to the node *two after* it. Budget two sacrificial nodes for every jump. The same
+two-node loss happens **automatically** wherever `ContinentID` changes between consecutive nodes —
+you do not need to set the flag for a map change, and Blizzard generally does not. See Part 3.
 
 **[VERIFIED] `Delay` is in seconds.** Everything else time-related in this system is milliseconds,
 which makes this an easy mistake: `Delay = 60000` is not a one-minute stop, it is a sixteen-hour
@@ -363,15 +407,19 @@ Create one row with `type = 15`.
 
 **Real values from the shipped transports**, which bound what is known to work:
 
-| | Ships | Zeppelins | Turtles | Gunships |
-|---|---|---|---|---|
-| `moveSpeed` (`Data1`) | 30 (15–21 on some) | 30 | 30 | 2 |
-| `accelRate` (`Data2`) | **1** | **1** | **1** | **1** |
-| `transportPhysics` (`Data5`) | 1 | 0 | 0 | 61 |
+| | Ships | Zeppelins | Turtles | Gunships (patrol) | Gunships (raid) |
+|---|---|---|---|---|---|
+| `moveSpeed` (`Data1`) | 30 (15–21 on some) | 30 (10 and 40 on two) | 30 | 2 | 20 |
+| `accelRate` (`Data2`) | 1 | 1 | 1 | 1 | 10 |
+| `transportPhysics` (`Data5`) | 1 | 0 | 0 | 61 | 0 or 61 |
 
-**[VERIFIED] `accelRate` is `1` on every shipped transport**, and `TransportPhysics.dbc` contains
-exactly three rows — `1`, `21` and `61`. Any other value in `Data5` points at a row that does not
-exist.
+**[VERIFIED] `accelRate` is `1` on every shipped ship, zeppelin and turtle, and on the two Icecrown
+patrol airships.** The eight raid gunships use `10` and the raid zeppelin uses `5` — so higher values
+are known-good, they are just rare. Only the patrol airships appear in the `transports` table; the
+raid ones are created by instance scripts.
+
+**[VERIFIED] `TransportPhysics.dbc` contains exactly three rows** — `1`, `21` and `61`. Any other
+value in `Data5` points at a row that does not exist.
 
 **[VERIFIED] Neither `moveSpeed` nor `accelRate` is validated, and `0` in either is fatal.**
 `accelRate = 0` divides by zero while computing the timing model; `moveSpeed = 0` produces an
@@ -379,7 +427,7 @@ infinite travel time. Both corrupt the route's total duration, and a duration of
 movement tick divide by zero on its very first run. Nothing warns you.
 
 **[VERIFIED] `Data0 = 0` is silently skipped.** No template is built and nothing is logged. The
-transport simply never exists. One shipped entry does exactly this.
+transport simply never exists.
 
 Other columns worth noting:
 
@@ -400,7 +448,11 @@ decelerates from there.
 Two practical consequences:
 
 - **Stops, not nodes, define the speed profile.** The vessel does not slow down for ordinary
-  nodes, only for `Flags = 2` ones. A route with no stops at all cruises forever at `moveSpeed`.
+  nodes, only for `Flags = 2` ones. But a route with **no** `Flags = 2` node anywhere does *not*
+  cruise at constant speed: with no stop to anchor the timetable the core falls back to keyframe 0,
+  so the vessel decelerates to a dead stop at the end of every lap and accelerates away again. It
+  simply never pauses, because no `Delay` applies. Genuinely constant motion is not achievable — put
+  the unavoidable slow-down somewhere the player will not be looking.
 - **The total cycle time is derived, not configured.** There is no "period" column anywhere. Change
   the speed and the whole timetable shifts.
 
@@ -411,8 +463,9 @@ speed — which is why Blizzard's dock-to-dock legs are kilometres long and the 
 
 #### The addon row
 
-**[CONVENTION] Every shipped transport uses identical values:** `faction = 0`, `flags = 40`. That
-flag value combines "is a transport" and "does not despawn".
+**[CONVENTION] Every shipped transport but one uses identical values:** `faction = 0`,
+`flags = 40` — a combination of "is a transport" and "does not despawn". The exception is the
+Icecrown raid zeppelin, which ships with `flags = 0`.
 
 **[VERIFIED] The row is not required by any check — and omitting it is a silent mistake.** With no
 addon row the core skips applying faction and flags entirely, leaving both zero, so your transport
@@ -433,8 +486,11 @@ This is what actually spawns the vessel.
 from a single template row. A second ship needs a second `gameobject_template` entry, which may
 reuse the same `Data0` path if you want them on the same route.
 
-**[VERIFIED] The spawn position and map are not in this table.** They come from the **first node of
-the taxi path**. There is nowhere to specify where a transport starts.
+**[VERIFIED] The spawn position and map are not in this table.** They come from the **first
+surviving keyframe** of the taxi path. Because the core trims the first node unless it is a stop or
+carries an event (see 1.4), that is normally **node index 1**, not node 0 — on one shipped route
+that is 165 yards along. Only two shipped paths keep their node 0. There is nowhere to specify where
+a transport starts.
 
 **[VERIFIED] The worst failure mode in the whole system lives here.** If the entry named by a
 `transports` row is not `type = 15` — or is missing from `gameobject_template` entirely — the row
@@ -488,8 +544,11 @@ first:**
 **[VERIFIED] Neither applies to `creature` or `gameobject` spawn rows.** Those are not
 range-checked at all — an out-of-range passenger simply floats in space somewhere, with no error.
 
-> **[CONVENTION] Design any walkable deck within ±75 on every axis.** That is the real constraint,
-> and it comfortably fits every Blizzard hull.
+> **[CONVENTION] Design any walkable deck within ±75 on every axis.** That is the real constraint.
+> It fits every Blizzard ship and zeppelin hull, but **not** Orgrim's Hammer, whose upper-deck crew
+> sit at Z offsets of 84–90 — outside the limit. Watch the Z axis in particular: the check is
+> applied per axis, so on a tall vessel the deck can sit more than 75 above the transport origin
+> even when X and Y are comfortable.
 
 #### Writing the spawn rows
 
@@ -607,14 +666,14 @@ reused as the **minimum and maximum delay in milliseconds** before that step run
  (@ENTRY*100,9,1,0,0,0,100,0, 0,0,0,0,0, 1,1,0,0,0,0,0, 19,34721,100,0,0, 0,0,0,0,
   'First mate says line 1'),
  (@ENTRY*100,9,2,0,0,0,100,0, 3000,3000,0,0,0, 5,5,0,0,0,0,0, 19,34715,100,0,0, 0,0,0,0,
-  'Captain plays talk emote after 3s');
+  'Captain plays emote 5 (exclamation) after 3s');
 ```
 
 Action list steps can target on-deck crew or dockside NPCs interchangeably.
 
 #### Free hooks in the stock data
 
-**[VERIFIED]** Of the 49 arrival/departure event ids in the shipped transport paths, **33 fire into
+**[VERIFIED]** Of the 51 arrival/departure event ids in the shipped transport paths, **37 fire into
 nothing at all** — no script row, no C++ handler. Among them:
 
 - **Every departure event on the three classic zeppelins.** They fire on schedule and do nothing.
@@ -651,7 +710,9 @@ the path points as offsets.
 - The creature's spawn row uses waypoint movement type.
 - A creature-addon row links the spawn to a waypoint path id.
 - The first waypoint sits exactly on the spawn offset.
-- `orientation` is set only on points where the NPC pauses, and left null elsewhere.
+- `orientation` is set only on points where the NPC pauses, and left null elsewhere. **[VERIFIED]**
+  this one is enforced, not stylistic: the core applies a waypoint's facing only where `delay > 0`
+  and ignores it everywhere else, with nothing logged.
 - Waypoint `delay` is in **milliseconds** — unlike taxi node `Delay`, which is seconds.
 
 The core keeps each passenger's "home position" updated as the vessel moves, so an NPC that is
@@ -661,6 +722,28 @@ ocean.
 **[VERIFIED] One caveat:** every NPC created on a transport is flagged to ignore pathfinding,
 because transport geometry is not part of the server's navigation data. Deck NPCs move in straight
 lines between waypoints. Keep paths simple and clear of railings.
+
+### 1.11 Removing or replacing a transport
+
+Tearing one down has its own ordering trap, which is the trap in 1.2 running backwards.
+
+1. **`DELETE` the `transports` row first.** Leaving it behind after the template goes is exactly the
+   silent failure described in 1.7.
+2. **Delete the passenger rows** on the pseudo-map, or they log "spawned at nonexistent map" on
+   every boot once the `Map.dbc` row goes.
+3. **Delete the script, addon and template rows.**
+4. **In the DBCs, delete the `TaxiPathNode.dbc` rows *before* the `TaxiPath.dbc` row.** This is the
+   1.2 trap in reverse: the node lookup array is sized from the highest `TaxiPath.ID` and indexed by
+   each node's `PathID` with no bounds check, so removing the highest path row while its nodes
+   survive corrupts the heap at startup. It bites hardest when tearing down the Part 4 example,
+   whose path id is the highest in the file.
+5. **Redeploy both DBC copies** (clearing the extractor output first, per 1.1) and bump the client
+   cache version (Part 4.5).
+6. **Expect one casualty:** any character who logged out on the deck is relocated to their homebind
+   with an error on next login. That is the documented behaviour, not a new fault.
+
+**[CONVENTION]** To reroute an existing transport, edit its path's coordinates in place rather than
+renumbering. Keeping the same `TaxiPath.ID` and `NodeIndex` range avoids both ordering traps.
 
 ---
 
@@ -756,12 +839,29 @@ template's `Data1` (`startOpen`) regardless of what the spawn row says. **[CONVE
 consistent anyway — `state = 1` when `Data1 = 0`. A value of 3 or higher is rejected and the spawn
 is skipped.
 
-**[VERIFIED] `Data0` (`pause`) changes what the object *is*.** A type-11 with a non-zero `pause` is
-no longer treated as a moving transport by the core's own classification. **[CONVENTION]** Leave it
-at `0` for a continuously cycling lift; the shipped elevators all do.
+**[VERIFIED] `Data1` must be `0` for a self-cycling lift.** The animation counter only advances
+while the object is in the *ready* state. A non-zero `startOpen` puts it in the *active* state at
+creation, the counter never increments, the broadcast phase never changes, and **the platform never
+moves — with nothing logged**. The three shipped templates that set it are all deliberately parked
+until an instance script releases them.
 
-**[VERIFIED] `Data2` (`autoCloseTime`)** is the usual gameobject auto-close timer, stored in
-1/65536ths of a second. Shipped elevators use `0` or `3000`.
+**[CONVENTION] An elevator needs a `gameobject_template_addon` row too** — `faction = 0`,
+`flags = 40`, exactly as for a type 15 (Part 1.7). Every shipped elevator template that has a spawn
+carries the transport bit; without it the client does not treat the platform as something you ride.
+
+**[VERIFIED] `Data0` (`pause`) is written straight to the object's level field and is otherwise
+unused server-side.** The one function that classifies on it is never called, so a non-zero value
+does *not* stop the server animating the platform — but the value is published to clients, and that
+is how the client knows where to park it. **[CONVENTION]** Leave it at `0` for a continuously
+cycling lift: 70 of the 89 shipped type-11 templates do. It is not universal — 19 set a non-zero
+pause, including several named elevators, all of them deliberately parked until a script releases
+them by clearing the value and setting the ready state.
+
+**[VERIFIED] `Data2` (`autoCloseTime`) is in milliseconds** — the `/65536` conversion the field
+name implies was removed in 3.0.3 and is not applied. Shipped elevators use `0` or `3000`, which
+only makes sense read as 3 seconds. **In practice it does nothing for type 11**: the elevator tick
+never consults it, and the only readers are the door/button/goober use paths, so an elevator's
+auto-close timer never fires. Leave it at `0`.
 
 **[VERIFIED] `animprogress`** is passed through untouched. **[CONVENTION]** `100` on the classic
 elevators, `255` on some later ones. It does not drive the animation.
@@ -803,12 +903,19 @@ map. There is no separate mechanism, but several rules become load-bearing.
 **[VERIFIED] You do not set a flag for a map change.** Whenever `ContinentID` differs between two
 consecutive nodes, the core inserts a teleport automatically.
 
-The shipped Menethil-to-Theramore route is laid out exactly this way: nodes 0–9 sit on the Eastern
-Kingdoms, nodes 10–18 on Kalimdor, and nothing marks the boundary. The vessel sails to the last
-node on the first map, vanishes, and reappears at the first node on the second.
+**[VERIFIED] The two nodes at the boundary are both discarded.** The node whose `ContinentID`
+differs from the next one is never turned into a keyframe — it only sets the *previous* keyframe's
+teleport flag — and the node immediately after it is skipped as well. So the vessel sails to the
+**second-to-last** node on the first map, vanishes, and reappears at the **second** node on the
+next one. On the shipped Menethil-to-Theramore route, nodes 0–9 sit on the Eastern Kingdoms and
+10–18 on Kalimdor; the jump actually runs node 8 → node 11, and nodes 9 and 10 are never visited.
+This is on top of the first/last-node trim in 1.4 — a separate mechanism.
 
-**[CONVENTION]** Place the two nodes either side of a transition far out at sea, well away from
-anywhere a player can see shore. The jump is instant and visible if it happens in view of land.
+**[CONVENTION]** Put **four** nodes out at sea around the transition — two on each side, well away
+from anywhere a player can see shore. The inner pair is consumed by the mechanism above, so it is
+the *outer* pair that becomes the visible departure and arrival point. Author exactly one node per
+side and you lose both, moving the jump somewhere you did not choose. It is instant and obvious if
+it lands in view of land.
 
 **[VERIFIED] The closing leg is a teleport anyway**, so a two-continent round trip closes naturally
 — the padding advice in 1.4 only matters for single-map loops.
@@ -830,9 +937,10 @@ If you put a `transports` row in for one, it will be silently ignored.
 
 ### 3.3 What happens to everyone on board
 
-**[VERIFIED] The hop happens in two stages**, one tick apart: the transport marks itself for a
-delayed teleport and unloads its static passengers, then on the following update it switches maps,
-moves itself, and re-adds itself to the new map.
+**[VERIFIED] The hop happens in two phases of the same world tick**: the transport marks itself for
+a delayed teleport and unloads its static passengers, then, in the delayed-update phase that runs
+immediately after every map's normal update, it switches maps, moves itself, and re-adds itself to
+the new map.
 
 Who survives:
 
@@ -863,7 +971,8 @@ spawn list, so one pseudo-map serves the whole journey. You do not need one per 
 ## Part 4 — Worked example: a new ship, end to end
 
 This builds a complete, working ship called **The Seafarer**: a ferry with two docks, a crew on
-deck, and a dockmaster who announces arrivals — all from SQL plus two DBC tables.
+deck, and a dockmaster who announces arrivals — all from SQL plus three DBC files
+(`TaxiPath.dbc`, `TaxiPathNode.dbc`, and one copied `Map.dbc` row).
 
 ### 4.1 What this example does, and one deliberate choice
 
@@ -993,7 +1102,8 @@ INSERT INTO `gameobject_template_addon`
   (@ENTRY, 0, 40, 0, 0);
 
 -- --- the spawn --------------------------------------------
--- No position here: the vessel starts at the first node of @PATH.
+-- No position here: the vessel starts at the first *surviving* node of @PATH.
+-- Node 0 is trimmed (Part 1.4), so that is node 1.
 DELETE FROM `transports` WHERE `entry` = @ENTRY OR `guid` = @GUID;
 INSERT INTO `transports` (`guid`,`entry`,`name`,`ScriptName`) VALUES
   (@GUID, @ENTRY, 'The Seafarer - custom ferry', '');
@@ -1007,7 +1117,7 @@ INSERT INTO `creature`
    `position_x`,`position_y`,`position_z`,`orientation`,
    `spawntimesecs`,`wander_distance`,`currentwaypoint`,`curhealth`,`curmana`,`MovementType`) VALUES
   (@CGUID,   @CREW, @PMAP, 0, 0, 1, 1, 0, 0,  -2.2334,  2.55383, 6.09902, 1.57667,  300, 0, 0, 1, 0, 0),
-  (@CGUID+1, @CREW, @PMAP, 0, 0, 1, 1, 0, 0,   9.59588, -1.21492, 6.09808, 0.0174532, 300, 0, 0, 1, 0, 0),
+  (@CGUID+1, @CREW, @PMAP, 0, 0, 1, 1, 0, 0,  -9.323,   -1.66992, 6.09808, 0.0174532, 300, 0, 0, 1, 0, 0),
   (@CGUID+2, @CREW, @PMAP, 0, 0, 1, 1, 0, 0,  21.2882, -6.49847, 6.34678, 3.66717,  300, 0, 0, 1, 0, 0);
 
 -- --- dock announcements, no C++ required ------------------
@@ -1030,12 +1140,28 @@ produce speech. Without them the event still fires and simply says nothing — h
 
 ### 4.5 Bring it up
 
-1. **Deploy the DBC changes to both sides.** Client patch archive *and* server DBC folder.
-2. **If you changed `GameObjectDisplayInfo.dbc`, re-run the vmap extraction** (Part 5). This
-   example reuses an existing model, so you can skip it.
+1. **Deploy the DBC changes to both sides.** Client patch archive *and* server DBC folder. If you
+   re-extract rather than hand-copy, **empty the extractor's output `dbc/` folder first** — it skips
+   files that already exist and will hand you your old DBCs back while reporting success.
+2. **If you changed `GameObjectDisplayInfo.dbc`, re-run the vmap extraction** (Part 5), clearing its
+   working directory first. This example reuses an existing model, so you can skip it.
 3. **Run the SQL.**
 4. **Restart worldserver.** **[VERIFIED] There is no reload command** for `gameobject_template`,
    `gameobject`, `creature`, `transports`, or any DBC. A restart is mandatory.
+5. **Bump the client cache version — if you edited an entry a client has already seen.** The client
+   caches gameobject query responses on disk, and that cache holds the `DataN` values: the taxi path
+   id, the speed and the acceleration. Re-point `Data0`, retune `Data1`/`Data2`, or edit a shipped
+   boat, and returning clients keep simulating the old route while the server runs the new one —
+   with nothing logged on either side. Raise the cache version your core exposes for this (a
+   `ClientCacheVersion` setting, backed by a value in the world database), which is sent at login and
+   makes the client discard the cached data. For local testing you can instead delete the client's
+   `Cache/WDB/` folder. **A brand-new entry, like this example, has never been queried, so this does
+   not apply on first deployment.**
+6. **Ship the patch archive to every player.** Each client that needs to see or board the vessel
+   must hold the same `TaxiPath.dbc` and `TaxiPathNode.dbc` bytes. The server never sends the
+   transport's position (Part 1.1), so a client without them is told the object exists but cannot
+   draw it, and its player cannot board it. Nothing is logged on either side. This is easy to miss
+   because it works perfectly on the machine you built it on.
 
 ### 4.6 Verify it, in order
 
@@ -1053,7 +1179,8 @@ silent failure in the system.
 **3 — Check for load errors.** Search the SQL error log for your entry, your pseudo-map, and your
 spawn guids. Missing-map and invalid-display errors both appear here.
 
-**4 — Find it in the world.** Fly to the first node's coordinates. The vessel starts there at
+**4 — Find it in the world.** Fly to the first *surviving* keyframe — node 1,
+`(-4235.141, 2589.259)`, **not** node 0, which is trimmed (Part 1.4). The vessel starts there at
 server boot and moves continuously, so allow for it being partway round.
 
 **5 — Stand on it.** The deck should be solid. **If you fall through, the model has no collision
@@ -1074,7 +1201,8 @@ sent home means your offsets exceeded the limits in Part 1.8.
 
 ### 4.7 Second example: a custom elevator
 
-Much shorter, because an elevator is one `gameobject` row plus animation frames.
+Much shorter, because an elevator is a template plus its addon row, one `gameobject` row, and
+animation frames.
 
 ```sql
 SET @EENTRY := 900200;
@@ -1089,6 +1217,12 @@ INSERT INTO `gameobject_template`
    0,     -- Data1 startOpen
    0,     -- Data2 autoCloseTime
    '', '');
+
+-- --- faction / flags (same as every shipped elevator)
+DELETE FROM `gameobject_template_addon` WHERE `entry` = @EENTRY;
+INSERT INTO `gameobject_template_addon`
+  (`entry`,`faction`,`flags`,`mingold`,`maxgold`) VALUES
+  (@EENTRY, 0, 40, 0, 0);
 
 DELETE FROM `gameobject` WHERE `guid` = @EGUID;
 INSERT INTO `gameobject`
@@ -1160,12 +1294,18 @@ saw it.
 
 1. Put the model files into the client patch archive.
 2. Put the new `GameObjectDisplayInfo` row into the **client's** DBC, inside that archive.
-3. Run the **vmap extractor** against the client. It walks the display info table and extracts
+3. **Empty the extractor's output first.** Delete its working directory and the old `vmaps/` output.
+   **[VERIFIED]** The extractor refuses to start at all if it finds its own previous working
+   directory — it prints that the output directory is polluted and exits *before extracting
+   anything*, which on a previously-extracted server is what will happen every time. It also skips
+   any model whose converted file is already present, so a model re-exported under its old filename
+   is silently kept at the old geometry.
+4. Run the **vmap extractor** against the client. It walks the display info table and extracts
    every referenced model.
-4. Run the **vmap assembler**. This produces the compiled gameobject model index.
-5. Copy the resulting vmap data — including that index — to the server's data folder.
-6. Copy the DBC to the server's DBC folder too, so the server has the row.
-7. Restart.
+5. Run the **vmap assembler**. This produces the compiled gameobject model index.
+6. Copy the resulting vmap data — including that index — to the server's data folder.
+7. Copy the DBC to the server's DBC folder too, so the server has the row.
+8. Restart.
 
 **[VERIFIED] If the display id is missing from the compiled index, nothing is logged at all.** The
 object loads, renders on the client, and has no collision. Players walk through the hull and fall
@@ -1181,6 +1321,11 @@ row. It will spawn happily with a nonexistent model.
 **[CONVENTION] Quick way to check the server knows your display id:** temporarily create a normal
 gameobject template using it and try to spawn it with the GM object-add command. That path *does*
 validate the display id and will tell you if it is missing. Delete it afterwards.
+
+This only proves the **DBC row** exists. It says nothing about collision — that check never consults
+the compiled model index and never complains when a display id is missing from it. To test
+collision, spawn the temporary object and try to stand on it. If you fall through, the extraction
+failed, not the DBC.
 
 ### 5.3 Navigation
 
@@ -1223,9 +1368,11 @@ crash is coming** — the path id is in range but has no usable nodes.
 | Symptom | Likely cause |
 |---|---|
 | **Visible to you in the wrong place**, or players cannot board something they can see | **Client and server taxi tables disagree** (Part 1.1). The most common cause of "boats are broken". |
+| Wrong position, but the client and server DBCs are byte-identical | Stale client-side gameobject query cache, after editing `DataN` on an entry a client had already seen. Bump the cache version or clear the client's cache folder (Part 4.5) |
+| **Works on your client, invisible or un-boardable for everyone else** | Those clients do not have your patch archive (Part 4.5, step 6) |
 | **Players fall through the deck** | Display id missing from the compiled model index (Part 5.2). Silent. |
 | **Jumps position once per loop** | Closing leg not padded (Part 1.4) |
-| Never moves at all | Route duration is zero, or every node is at the same position |
+| Never moves at all | Only one keyframe survived path generation — the movement tick returns immediately at one or fewer. Usually a three-node path whose ends were trimmed (Part 1.4), or a map change that consumed one. Add nodes, or make an end node a stop so it is not trimmed. A zero route duration does **not** stall it — that crashes the server; see 6.1 |
 | Moves but never stops | No node has `Flags` exactly `2` — remember it is not a bitmask |
 | Stops for far too long | `Delay` entered in milliseconds; it is **seconds** |
 | Crosses the map in view of shore | Put the transition nodes further out (Part 3.1) |
@@ -1236,7 +1383,7 @@ crash is coming** — the path id is in range but has no usable nodes.
 |---|---|
 | Deck completely empty | `Data6` does not match the spawn rows' `map`, or `spawnMask` has bit 0 unset |
 | *"spawned at nonexistent map"* in the SQL log | The pseudo-map has no `Map.dbc` row on the server (Part 1.8) |
-| NPCs appear but objects do not | Pseudo-map's `InstanceType` is non-zero — silently drops gameobject spawns |
+| NPCs appear but objects do not | Pseudo-map's `InstanceType` is `1` or `2` (dungeon/raid) and it has no instance template row — every gameobject passenger is dropped with a misleading "invalid coordinates" message. Creatures are unaffected |
 | **Two of every crewman** | Two transports sharing one pseudo-map in `Data6` |
 | NPCs hover above or sink into the deck | Offsets wrong — stand where you want them and read your own offsets |
 | A placed object sits motionless in the ocean | Written with the GM object-add command, which is not transport-aware (Part 1.8) |
@@ -1262,7 +1409,8 @@ crash is coming** — the path id is in range but has no usable nodes.
 | Symptom | Likely cause |
 |---|---|
 | Does not move | No `TransportAnimation` rows for that **gameobject entry**. Silent. |
-| Does not move | `Data0` (`pause`) is non-zero, so it is not treated as a moving transport |
+| Does not move | `Data1` (`startOpen`) is non-zero, so the object spawns in the active state and its animation counter never advances. Silent |
+| Does not move | `Data0` (`pause`) is non-zero. This does **not** stop the server animating it, but the value is published to clients and parks the platform — set it to `0` |
 | Moves for some players only | Client DBC copies differ between them |
 | Jumps at the end of its cycle | First and last animation frames are not at the same position |
 | NPCs will not ride it | **[VERIFIED]** Not possible — use a type-15 with a vertical path instead |
@@ -1271,7 +1419,7 @@ crash is coming** — the path id is in range but has no usable nodes.
 
 | Symptom | Cause |
 |---|---|
-| Changes have no effect | **[VERIFIED]** There is no reload command for any of these tables or DBCs. Restart worldserver. |
+| Changes have no effect | **[VERIFIED]** There is no reload command for `gameobject_template`, `gameobject`, `creature`, `transports` or any DBC — restart worldserver. The script tables are the exception: `.reload smart_scripts` and `.reload event_scripts` both work, so you can iterate on Part 1.9 scripting without restarting |
 | Cannot teleport to the pseudo-map | By design — the GM teleport commands explicitly refuse transport maps. Go to the vessel's world position instead. |
 | A second ship on the same template | Not possible — `transports.entry` is unique. Add a second template. |
 
@@ -1285,7 +1433,7 @@ crash is coming** — the path id is in range but has no usable nodes.
 |---|---|---|---|
 | `Data0` | `taxiPathId` | Yes | Required. `0` = silently skipped |
 | `Data1` | `moveSpeed` | Yes | Integer yards/sec. Never `0` |
-| `Data2` | `accelRate` | Yes | Integer yards/sec². Never `0`. Shipped value is always `1` |
+| `Data2` | `accelRate` | Yes | Integer yards/sec². Never `0`. `1` on 21 of the 30 shipped type-15 templates; the raid gunships use `10` and the raid zeppelin `5` |
 | `Data3` | `startEventID` | No | Client-side |
 | `Data4` | `stopEventID` | No | Client-side |
 | `Data5` | `transportPhysics` | No | Only `1`, `21`, `61` exist |
@@ -1299,7 +1447,7 @@ crash is coming** — the path id is in range but has no usable nodes.
 |---|---|---|---|
 | `Data0` | `pause` | Yes | Non-zero stops it counting as a moving transport |
 | `Data1` | `startOpen` | Yes | Overrides the spawn row's `state` |
-| `Data2` | `autoCloseTime` | Yes | In 1/65536 s |
+| `Data2` | `autoCloseTime` | Effectively no | Milliseconds on 3.3.5 (the `/65536` the name implies was removed in 3.0.3), but never read for type 11 |
 | `Data3` | `pause1EventID` | **No** | Dead field |
 | `Data4` | `pause2EventID` | **No** | Dead field |
 | `Data5` | `mapID` | No | Not used for type 11 |
@@ -1331,7 +1479,7 @@ crash is coming** — the path id is in range but has no usable nodes.
 | 2 | `NodeIndex` | Dense, zero-based, no gaps |
 | 3 | `ContinentID` | Must be a real map |
 | 4–6 | `X`, `Y`, `Z` | World coordinates. Boats use `Z = 0` |
-| 7 | `Flags` | `0` normal, `1` teleport, `2` stop. Exact match |
+| 7 | `Flags` | `0` normal, `1` teleport, `2` stop. Teleport is tested as a bitmask (`& 1`), stop as exact equality — so `3` teleports but is not a stop |
 | 8 | `Delay` | **Seconds** |
 | 9 | `ArrivalEventID` | Fires `event_scripts` and the gameobject AI |
 | 10 | `DepartureEventID` | As above |
@@ -1386,6 +1534,9 @@ Keep offsets within **±75** on every axis.
 7. `gameobject_template_addon` row with `faction = 0`, `flags = 40`.
 8. `transports` row.
 9. Passenger rows on the pseudo-map with offset coordinates, if any.
-10. vmap extraction re-run, if a new `displayId` was added.
+10. vmap extraction re-run, if a new `displayId` was added — with its working directory cleared
+    first, or it will silently keep the old output.
 11. worldserver restarted.
-12. Verified against the checklist in Part 4.6.
+12. Client cache version bumped, if you edited an entry clients had already seen (Part 4.5).
+13. Patch archive shipped to every player who needs to see or board it (Part 4.5).
+14. Verified against the checklist in Part 4.6.
